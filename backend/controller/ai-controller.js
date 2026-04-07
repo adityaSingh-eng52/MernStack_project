@@ -50,33 +50,84 @@ export const generateInterviewQuestions = async (req, res) => {
     });
     console.log("response: ", response);
 
-    const parts = response.candidates?.[0]?.content?.parts ?? [];
-    const rawText = parts
-      .filter((p) => !p.thought) // gemini-2.5-flash includes thinking parts; skip them
-      .map((p) => p.text ?? "")
-      .join("");
+    const rawText =
+      response.text ||
+      response.candidates?.[0]?.content?.parts
+        ?.filter((p) => !p.thought)
+        .map((p) => p.text ?? "")
+        .join("") ||
+      "";
 
-    const cleanedText = rawText
-      .replace(/^```json\s*/, "")
-      .replace(/^```\s*/, "")
-      .replace(/```$/, "")
-      .replace(/^json\s*/, "")
-      .trim();
-
-    let questions;
-    try {
-      questions = JSON.parse(cleanedText);
-    } catch {
-      const jsonMatch = cleanedText.match(/\[[\s\S]*\]/);
-      if (jsonMatch) questions = JSON.parse(jsonMatch[0]);
-      else throw new Error("Failed to parse AI response as JSON");
+    if (!rawText) {
+      throw new Error("AI returned no text output");
     }
 
-    if (!Array.isArray(questions)) throw new Error("Response is not an array");
+    const cleanedText = rawText
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/```$/, "")
+      .replace(/^json\s*/i, "")
+      .trim();
+
+    let rawJson = cleanedText;
+    let questions;
+    try {
+      questions = JSON.parse(rawJson);
+    } catch (firstError) {
+      const jsonMatch = rawJson.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
+      if (jsonMatch) {
+        questions = JSON.parse(jsonMatch[0]);
+      } else {
+        throw new Error("Failed to parse AI response as JSON");
+      }
+    }
+
+    if (!Array.isArray(questions) && questions?.questions) {
+      questions = questions.questions;
+    }
+
+    if (!Array.isArray(questions)) {
+      if (
+        questions &&
+        typeof questions === "object" &&
+        (questions.question || questions.prompt || questions.title)
+      ) {
+        questions = [questions];
+      }
+    }
+
+    if (!Array.isArray(questions)) {
+      throw new Error("Response is not an array");
+    }
+
+    const normalizedQuestions = questions
+      .map((item) => {
+        if (typeof item === "string") {
+          return { question: item.trim(), answer: "" };
+        }
+
+        if (item && typeof item === "object") {
+          const questionText =
+            item.question || item.prompt || item.title || item.text;
+          if (!questionText) return null;
+          return {
+            question: String(questionText).trim(),
+            answer:
+              item.answer || item.explanation || item.answerText || "",
+          };
+        }
+
+        return null;
+      })
+      .filter(Boolean);
+
+    if (normalizedQuestions.length === 0) {
+      throw new Error("No valid questions could be extracted from AI output");
+    }
 
     //! 4. save to DB — was completely missing before
     const saved = await Question.insertMany(
-      questions.map((q) => ({
+      normalizedQuestions.map((q) => ({
         session: sessionId,
         question: q.question,
         answer: q.answer || "",
